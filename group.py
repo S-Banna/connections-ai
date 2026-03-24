@@ -1,6 +1,21 @@
 import numpy as np
 from itertools import combinations
 from tqdm import tqdm
+from sklearn.neural_network import MLPClassifier
+import random
+
+
+# LOADING DATASET
+
+import json
+
+with open("dataset.json", "r", encoding="utf-8") as f:
+    dataset = json.load(f)
+
+print("Loaded games:", len(dataset))
+print("Sample game keys:", dataset[0].keys())
+
+# LOADING FASTTEXT
 
 def load_fasttext(path):
     embeddings = {}
@@ -16,12 +31,9 @@ def load_fasttext(path):
     return embeddings
 
 ft = load_fasttext("wiki-news-300d-1M-subword.vec/wiki-news-300d-1M-subword.vec")
-words = [
-    "Gaggle", "Pack", "Pod", "Pride",
-    "Glacier", "Molasses", "Sloth", "Traffic",
-    "Cartwright", "Two", "Wrath", "Wrestle",
-    "Any", "Emmy", "Envy", "Okay"
-]
+
+
+# HELPER FUNCTIONS
 
 def normalize(word):
     return word.lower().replace("'", "").replace("-", " ")
@@ -32,26 +44,135 @@ def get_vector(word):
 def cosine(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-def group_score(group):
+
+# TRAINING
+
+split_idx = int(len(dataset) * 0.05)
+
+train_games = dataset[split_idx:]
+test_games = dataset[:split_idx]
+manual_testing = test_games[:10]
+
+X = []
+y = []
+
+for game in train_games:
+    correct_groups = game["answers"]
+    all_words = game["words"]
+
+    correct_sets = [set(g["words"]) for g in correct_groups]
+
+    # positives
+    for g in correct_groups:
+        vecs = [get_vector(w) for w in g["words"]]
+        if any(v is None for v in vecs):
+            continue
+
+        mean = np.mean(vecs, axis=0)
+
+        pairs = list(combinations(vecs, 2))
+        sims = [cosine(a, b) for a, b in pairs]
+
+        sim_mean = np.mean(sims)
+        sim_std = np.std(sims)
+
+        feat = np.concatenate([mean, [sim_mean, sim_std]])
+        X.append(feat)
+
+        y.append(1)
+
+    # negatives
+    all_combos = list(combinations(all_words, 4))
+    random.shuffle(all_combos)
+    
+    neg_added = 0
+    for combo in all_combos:
+        if set(combo) not in correct_sets:
+            vecs = [get_vector(w) for w in combo]
+            if any(v is None for v in vecs):
+                continue
+            mean = np.mean(vecs, axis=0)
+
+            pairs = list(combinations(vecs, 2))
+            sims = [cosine(a, b) for a, b in pairs]
+
+            sim_mean = np.mean(sims)
+            sim_std = np.std(sims)
+
+            feat = np.concatenate([mean, [sim_mean, sim_std]])
+            X.append(feat)
+
+            y.append(0)
+            neg_added += 1
+        if neg_added >= 10:
+            break
+
+model = MLPClassifier(
+    hidden_layer_sizes=(64,),
+    max_iter=10
+)
+
+print("Training samples:", len(X))
+model.fit(X, y)
+
+
+# SCORING
+
+def nn_score(group):
     vecs = [get_vector(w) for w in group]
     if any(v is None for v in vecs):
-        return -1  # discard invalid groups
-    
+        return 0
+
+    mean = np.mean(vecs, axis=0)
+
     pairs = list(combinations(vecs, 2))
     sims = [cosine(a, b) for a, b in pairs]
-    return sum(sims) / len(sims)
 
-all_groups = list(combinations(words, 4))
+    sim_mean = np.mean(sims)
+    sim_std = np.std(sims)
+
+    feat = np.concatenate([mean, [sim_mean, sim_std]])
+
+    return model.predict_proba([feat])[0][1]
+
+def final_score(group):
+    # cosine part
+    vecs = [get_vector(w) for w in group]
+    if any(v is None for v in vecs):
+        return -1
+
+    pairs = list(combinations(vecs, 2))
+    sims = [cosine(a, b) for a, b in pairs]
+    cos_score = sum(sims) / len(sims)
+
+    # nn part
+    nn_s = nn_score(group)
+
+    # weighting
+    return 0.5 * cos_score + 0.5 * nn_s
+
+
+# SAMPLE
+
+test_game = random.choice(manual_testing)
+
+print("\nWords:", test_game["words"])
+print("\nCorrect:")
+for g in test_game["answers"]:
+    print(g["words"])
+
+all_groups = list(combinations(test_game["words"], 4))
 
 scored = []
 for g in all_groups:
-    score = group_score(g)
-    if score != -1:
-        scored.append((g, score))
+    s = final_score(g)
+    if s != -1:
+        scored.append((g, s))
 
 scored.sort(key=lambda x: x[1], reverse=True)
 
-TOP_K = 10
+correct_sets = [set(g["words"]) for g in test_game["answers"]]
 
-for i, (group, score) in enumerate(scored[:TOP_K]):
-    print(f"{i+1}. Score: {score:.3f} | {group}")
+print("\nTop guesses:")
+for i, (g, s) in enumerate(scored[:10]):
+    print(i+1, set(g) in correct_sets, f"{s:.3f}", g)
